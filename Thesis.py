@@ -41,29 +41,20 @@ from sklearn.preprocessing import LabelEncoder
 from imblearn.over_sampling import RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
 from skimage import io, color, data
-from skimage.morphology import binary_dilation, binary_erosion, binary_opening, binary_closing, disk, remove_small_objects, square
-from skimage.segmentation import clear_border, watershed, flood_fill, slic, mark_boundaries, chan_vese
 from skimage.filters.rank import median
 from skimage.util import img_as_float, img_as_ubyte
-from skimage.filters import threshold_local
-from skimage.morphology import dilation, erosion, opening, closing,reconstruction, extrema, binary_closing
 from skimage.morphology import skeletonize
-from skimage import exposure
 from tqdm import tqdm
 from pandas._libs import index
 from torch.utils.data.dataset import TensorDataset
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
-from pandas._libs import index
-from torch.utils.data.dataset import TensorDataset
-from torch.utils.data import Dataset, DataLoader
 from torch.nn.functional import normalize
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 
 plt.style.use('default')
-filepath = '/content/drive/MyDrive/Thesis/Pics/'
+filepath = ()
 
 from google.colab import drive
 drive.mount('/content/drive')
