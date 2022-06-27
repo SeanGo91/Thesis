@@ -8,7 +8,7 @@ Three CNN's were developed based on previous work in the field of Deep Learning 
 investigate the variation in classifcation results after image processing was implemented
 
 ## Data
-Images in 424 x 424 x 3 .PNG format downloaded from Galazy Zoo 2 online repository: https://zenodo.org/record/4573248#.YrmDdRVBw2w
+Images in 424 x 424 x 3 .PNG format downloaded from Galaxy Zoo 2 online repository: https://zenodo.org/record/4573248#.YrmDdRVBw2w
 
 
 ## Description
