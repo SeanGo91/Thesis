@@ -8,22 +8,6 @@ else:
   device=torch.device('cpu')
 #print("Device: {}".format(device))
 
-gpu_info = !nvidia-smi
-gpu_info = '\n'.join(gpu_info)
-if gpu_info.find('failed') >= 0:
-  print('Not connected to a GPU')
-else:
-  print(gpu_info)
-
-
-from psutil import virtual_memory
-ram_gb = virtual_memory().total / 1e9
-print('Your runtime has {:.1f} gigabytes of available RAM\n'.format(ram_gb))
-
-if ram_gb < 20:
-  print('Not using a high-RAM runtime')
-else:
-  print('You are using a high-RAM runtime!')
 
 import PIL
 from PIL import Image, ImageEnhance
@@ -60,8 +44,9 @@ from google.colab import drive
 drive.mount('/content/drive')
 
 
+##SECTION 1: DATA PREPROCESSING
 
-#read file with classifications
+#read morphology catalogue from Galaxy Zoo with classifications
 df = pd.read_csv(filepath + 'gz_decals_volunteers_5.csv')
 df = df.sort_values('iauname')
 
@@ -129,21 +114,22 @@ columns = ['iauname',
  'spiral-arm-count_3_fraction',
  'spiral-arm-count_4_fraction',
  'spiral-arm-count_more-than-4_fraction',
- 
  'Arms',
  'Arm_Count',
  'Spiral_Valid']
 
 df_final = df_new[columns]
 
-#reset indext
+#reset index
 df_final = df_final.reset_index(drop = True)
+
 
 #subset for training
 from sklearn.model_selection import train_test_split
 
+#create train and test with 80/20 split
 X_train, X_test, y_train, y_test = train_test_split(df_final[['iauname','has-spiral-arms_yes']], df_final['Arm_Count'], test_size=0.2, random_state=1)
-
+#create validation set from train set, split 75/25
 X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=1)
 
 
@@ -161,7 +147,10 @@ def balance(df):
 
   # split into input and output elements
   X, y = df[['iauname','has-spiral-arms_yes']], df.Arm_Count
+  #Under sample majority class (arm count = 2)
   rus = RandomUnderSampler(random_state=0, sampling_strategy='majority')
+  
+  #Over sample classes to resize data set
   X_u, y_u = rus.fit_resample(X, y)
   n = int(round(len(X)/ 5, 0))
   strategy = {0:n, 1:n, 2:n, 3:n, 4:n}
@@ -173,10 +162,17 @@ def balance(df):
 
 #resample train, validation and test set 
 
+##FINAL DATA SETS
 df_train = balance(df_train)
 df_valid = balance(df_val)
 df_test = balance(df_test)
 
+
+
+
+### SECTION 2: IMAGE PROCESSING  AND DATA AUGMENTATION
+
+#IMAGE PROCESSING
 
 #function to load RGB images
 def basic(filepath, filename, gamma):
@@ -191,18 +187,130 @@ def skel_images(filepath, filename, gamma_size, block_size, disk_size):
   
   image = io.imread(filepath + filename[:4] + '/' + filename + '.png')
 
+  #Change image to float and then apply gamma correction, dependent on gamma_size parameter
   image = img_as_float(image)
   image = exposure.adjust_gamma(image, gamma_size)
+  
+  #grayscale image
   image = color.rgb2gray(image)
 
+  #crop image to be 100 x 100
   image = image[int((image.shape[0]/2)-50):int((image.shape[0]/2)+50),int((image.shape[0]/2)-50):int((image.shape[0]/2)+50)]
-  disk_size = disk_size
+  
+  #apply median filter to reduce noise
   image = median(img_as_ubyte(image), disk(disk_size))
+  
+  #apply adaptive thresholding to binarize image
   adaptive_thresh = threshold_local(image, block_size, offset=0)
   image2 = image > adaptive_thresh
+  
+  #returen skelotonizated image
   return skeletonize(image2).astype(np.uint8)
 
+#DATA AUGMENTATION
 
+#create a torch data set
+gamma = 2.5
+block = 65
+disk_size = 3
+
+#image loader loads images based on filenames in df_train, df_valid and df_test
+#converts to tensors
+
+#returns 3 sets of results and the classification labels / file names for each observation
+#data1 = RGB images
+#data2 = skeletonized images
+#data3 = concatenated tensors of data1  and data2
+
+class imageloader(Dataset):
+  def __init__(self, base, df, in_col, out_col, transform1, transform2):
+    self.df = df
+    self.data1 = []
+    self.data2 = []
+    self.data3 = []
+    self.labels = []
+    self.files = []
+    for ind in tqdm(range(len(df))):
+      i1 = transform1(basic(base,df.iloc[ind][in_col],2))
+      i2 = transform2(skel_images(base,df.iloc[ind][in_col], gamma, block, disk_size))
+      i3 = torch.cat((i1.permute(1,2,0),i2.permute(1,2,0)),2).permute(2,0,1)
+      i4 = df.iloc[ind][out_col]
+      self.data1.append(i1)
+      self.data2.append(i2)
+      self.data3.append(i3)
+      self.labels.append(i4)
+      self.files.append(df.iloc[ind][in_col])
+  def __len__(self):
+    return len(self.data3)
+    #return len(self.skel)
+  def __getitem__(self, idx):
+    return  self.data1[idx], self.data2[idx], self.data3[idx], self.labels[idx], self.files[idx]
+
+#https://github.com/pytorch/examples/blob/42e5b996718797e45c46a25c55b031e6768f8440/imagenet/main.py#L89-L101
+#https://pytorch.org/vision/stable/models.html
+
+import torchvision.transforms as transforms
+normalize1 = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                  std=[0.229, 0.224, 0.225])
+
+
+#load imageloader in train/valid/test sets after applying image augmentation transformations on training data
+train_set = imageloader(filepath, df_train, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
+          transforms.ToPILImage(),
+          transforms.CenterCrop(100),
+          transforms.Resize(100),
+          transforms.RandomHorizontalFlip(),
+          transforms.RandomVerticalFlip(),
+          transforms.RandomApply([transforms.RandomRotation(180)], p = 0.5),
+          transforms.RandomApply([transforms.RandomRotation(90)], p = 0.5),
+          transforms.ColorJitter(brightness=(0.5,1.5), contrast=(1), saturation=(0.5,1.5), hue=(-0.1,0.1)),
+          transforms.ToTensor(),
+          normalize1
+      ]), transform2 = transforms.Compose([
+          transforms.ToPILImage(),
+          transforms.Resize(100),
+          transforms.RandomVerticalFlip(),
+          transforms.RandomApply([transforms.RandomRotation(180)], p = 0.5),
+          transforms.RandomApply([transforms.RandomRotation(90)], p = 0.5),
+          transforms.RandomHorizontalFlip(),
+          transforms.ToTensor(),
+          normalize 
+      ]))
+
+valid_set = imageloader(filepath, df_valid, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
+         transforms.ToPILImage(),
+         transforms.CenterCrop(100),
+         transforms.Resize(100),
+         transforms.ToTensor(),
+         normalize1
+     ]), transform2 = transforms.Compose([
+         transforms.ToPILImage(),
+          transforms.Resize(100),
+         transforms.ToTensor() ,
+         normalize
+     ]))
+
+test_set = imageloader(filepath, df_test, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
+         transforms.ToPILImage(),
+         transforms.CenterCrop(100),
+         transforms.Resize(100),
+         transforms.ToTensor(),
+         normalize1
+     ]), transform2 = transforms.Compose([
+         transforms.ToPILImage(),
+          transforms.Resize(100),
+         transforms.ToTensor() ,
+         normalize
+     ]))
+
+#load into dataloaders
+train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+valid_loader = DataLoader(valid_set, batch_size=64, shuffle=True)
+test_loader =  DataLoader(test_set, batch_size=64, shuffle=True)
+
+
+
+##SECTION 3: MODEL TRAINING
 
 #Define Maxout activation function
 class Maxout(nn.Module):
@@ -239,7 +347,7 @@ class Baseline(nn.Module):
 
         self.Flatten = nn.Flatten()
         
-        #Add a Linear layer with 64 units and relu activation
+        #Add a Linear layers
         self.Linear_1 = nn.Linear(in_features=128*8*8, out_features=2048, bias=True)
         self.Dropout_1 = nn.Dropout(drop)
         self.MaxOut_1 = Maxout(2)
@@ -283,7 +391,7 @@ class Baseline(nn.Module):
         return x, c1, m1, c2, m2, c3, c4,m4
 
 
-#Create Wide Dieleman CNN model
+#Create Wide Dieleman CNN model, variation of above with 2 times wider layers and the use of batch normalization
 
 class WideDieleman(nn.Module):
     def __init__(self, k, n, drop):
@@ -319,7 +427,7 @@ class WideDieleman(nn.Module):
 
         self.Flatten = nn.Flatten()
         
-        #Add a Linear layer with 64 units and relu activation
+        #Add a Linear layers
         self.Linear_1 = nn.Linear(in_features=1024*10*10, out_features=2048, bias=True)
         self.Dropout_L_1 = nn.Dropout(drop)
         self.MaxOut_1 = Maxout(2)
@@ -369,7 +477,7 @@ class WideDieleman(nn.Module):
         return x, c1, c2, c3, c4, c5, c6, c7
 
 
-#Create  Adapted Baseline CNN model
+#Create  Adapted Baseline CNN model, same as Baseline model but reduces kernel in layer 1 from 6,6 to 3,3
 
 class AdaptBaseline(nn.Module):
     def __init__(self, n, drop):
@@ -392,12 +500,11 @@ class AdaptBaseline(nn.Module):
 
         self.Flatten = nn.Flatten()
         
-        #Add a Linear layer with 64 units and relu activation
+        #Add a Linear layers
         self.Linear_1 = nn.Linear(in_features=128*9*9, out_features=2048, bias=True)
         self.Dropout_1 = nn.Dropout(drop)
         self.MaxOut_1 = Maxout(2)
-        
-        # Add the last Linear layer.
+  
         self.Linear_2 = nn.Linear(in_features=1024, out_features=2048, bias=True)
         self.Dropout_2 = nn.Dropout(drop)
         self.MaxOut_2 = Maxout(2)
@@ -437,119 +544,34 @@ class AdaptBaseline(nn.Module):
 
 
 
-#create a torch data set
 
-      class imageloader(Dataset):
-        def __init__(self, base, df, in_col, out_col, transform1, transform2):
-          self.df = df
-          self.data1 = []
-          self.data2 = []
-          self.data3 = []
-          self.labels = []
-          self.files = []
-          for ind in tqdm(range(len(df))):
-            i1 = transform1(basic(base,df.iloc[ind][in_col],2))
-            i2 = transform2(skel_images(base,df.iloc[ind][in_col], gamma, block, disk_size))
-            i3 = torch.cat((i1.permute(1,2,0),i2.permute(1,2,0)),2).permute(2,0,1)
-            i4 = df.iloc[ind][out_col]
-            self.data1.append(i1)
-            self.data2.append(i2)
-            self.data3.append(i3)
-            self.labels.append(i4)
-            self.files.append(df.iloc[ind][in_col])
-        def __len__(self):
-          return len(self.data3)
-          #return len(self.skel)
-        def __getitem__(self, idx):
-          return  self.data1[idx], self.data2[idx], self.data3[idx], self.labels[idx], self.files[idx]
+#Train models on data and test on valid set
 
-      #https://github.com/pytorch/examples/blob/42e5b996718797e45c46a25c55b031e6768f8440/imagenet/main.py#L89-L101
-      #https://pytorch.org/vision/stable/models.html
-
-      import torchvision.transforms as transforms
-      normalize1 = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                          std=[0.229, 0.224, 0.225])
+#CHOOSE MODEL TO TRAIN
+# n parameter tells model if input is skeletonized (n=1), rgb (n=3), or combined (n=4)
+# drop denotes dropout %, use 0.5
+model = Baseline(n, drop = 0.5).to(device)
 
 
-      #training set
-      train_set = imageloader(filepath, df_train, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
-                  transforms.ToPILImage(),
-                  transforms.CenterCrop(100),
-                  transforms.Resize(100),
-                  transforms.RandomHorizontalFlip(),
-                  transforms.RandomVerticalFlip(),
-                  transforms.RandomApply([transforms.RandomRotation(180)], p = 0.5),
-                  transforms.RandomApply([transforms.RandomRotation(90)], p = 0.5),
-                  transforms.ColorJitter(brightness=(0.5,1.5), contrast=(1), saturation=(0.5,1.5), hue=(-0.1,0.1)),
-                  transforms.ToTensor(),
-                  normalize1
-              ]), transform2 = transforms.Compose([
-                  transforms.ToPILImage(),
-                  transforms.Resize(100),
-                  transforms.RandomVerticalFlip(),
-                  transforms.RandomApply([transforms.RandomRotation(180)], p = 0.5),
-                  transforms.RandomApply([transforms.RandomRotation(90)], p = 0.5),
-                  transforms.RandomHorizontalFlip(),
-                  transforms.ToTensor(),
-                  normalize 
-              ]))
-
-      valid_set = imageloader(filepath, df_valid, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
-                 transforms.ToPILImage(),
-                 transforms.CenterCrop(100),
-                 transforms.Resize(100),
-                 transforms.ToTensor(),
-                 normalize1
-             ]), transform2 = transforms.Compose([
-                 transforms.ToPILImage(),
-                  transforms.Resize(100),
-                 transforms.ToTensor() ,
-                 normalize
-             ]))
-
-      test_set = imageloader(filepath, df_test, 'iauname', 'Arm_Count', transform1 = transforms.Compose([
-                 transforms.ToPILImage(),
-                 transforms.CenterCrop(100),
-                 transforms.Resize(100),
-                 transforms.ToTensor(),
-                 normalize1
-             ]), transform2 = transforms.Compose([
-                 transforms.ToPILImage(),
-                  transforms.Resize(100),
-                 transforms.ToTensor() ,
-                 normalize
-             ]))
-
-#load into dataloaders
-train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-valid_loader = DataLoader(valid_set, batch_size=64, shuffle=True)
-test_loader =  DataLoader(test_set, batch_size=64, shuffle=True)
-
-
-
-#train models on data and test on valid set
-
-learning_rates = 0.0001
-loader = test_loader
-drop = 0.5
-epoch = 50
-
-all_labels = []
-all_predictions = []
-files_test= []
-all_files = []
-
-
-model = Baseline(n,drop).to(device)
 optimizer = optim.AdamW(model.parameters(), lr=lr) 
 crossentropy_loss = nn.CrossEntropyLoss()
+learning_rates = 0.0001
+epoch = 50
 
+loader = test_loader
+
+#creating lists to save results for analysis later
+
+files_test= []
 train_accuracy = []
 train_loss = []
 test_accuracy = []
 test_loss = []
-model.train() 
+
 train_acc = 0 
+
+model.train() 
+
 for e in tqdm(range(epoch)):
   labels_test = []
   predictions_test = []
@@ -558,55 +580,70 @@ for e in tqdm(range(epoch)):
     for g in optimizer.param_groups:
       g['lr'] = 0.00005
   for images_rgb, images_skel, images_both, labels, files in train_loader: 
+    #decides which outputs from image loader to use
     if n == 1:
       images = images_skel.to(device)
     elif n == 3:
       images = images_rgb.to(device)
     else:
       images = images_both.to(device)
+      
+    #generate labels and predictions
     labels = labels.to(device)
     optimizer.zero_grad()           
     predictions = model(images)[0]     
+    
     loss = crossentropy_loss(predictions, labels) 
     running_train_loss =+ loss.item()
     loss.backward()
     optimizer.step()
+    
+    #calculate accuracy
     accuracy = (torch.max(predictions, dim=-1, keepdim=True)[1].flatten() == labels).sum() / len(labels)
     train_acc += accuracy.item()
+  
+  #calculate loss and accuracy per epoch and append to train_loss list
   train_loss.append(running_train_loss / len(train_loader))
   train_acc /= len(train_loader)
-  print('Train Loss' + str(running_train_loss / len(train_loader))+'\t Accuracy'+ str(train_acc))
   train_accuracy.append(train_acc)
+  
+  print('Train Loss' + str(running_train_loss / len(train_loader))+'\t Accuracy'+ str(train_acc))
+  
   
 
   model.eval() 
+  
   test_acc = 0 
   running_test_loss = 0
   with torch.no_grad(): 
     for images_rgb, images_skel, images_both, labels, files in loader: 
+        #decides which outputs from image loader to use
         if n == 1:
           images = images_skel.to(device)
         elif n == 3:
           images = images_rgb.to(device)
         else:
           images = images_both.to(device)
+          
+        #generate labels and predictions
         labels = labels.to(device)
         predictions = model(images)[0]
         accuracy = (torch.max(predictions, dim=-1, keepdim=True)[1].flatten() == labels).sum() / len(labels)
         test_acc += accuracy.item()
+        
         loss = crossentropy_loss(predictions, labels)
         running_test_loss =+ loss.item()
+        
         labels_test.append(labels)
         files_test.append(files)
         predictions_test.append(torch.max(predictions, dim=-1, keepdim=True)[1].flatten())   
-  all_labels.append(labels_test)
-  all_predictions.append(predictions_test)
-  all_files.append(files_test)
+
   test_acc /= len(loader)
   test_accuracy.append(test_acc)
   test_loss.append(running_test_loss / len(loader))
   print('Acc: ' + str(test_acc) + ', Test Loss' + str(running_test_loss / len(loader))+'\n')
 
+  
 #create confusion matrix from predictions
 from sklearn import metrics
 labels_list = []
@@ -616,13 +653,3 @@ for x, x2 in zip(labels_test, predictions_test):
     labels_list.append(float(y.cpu()))
     pred_list.append(float(y2.cpu()))
 print(metrics.confusion_matrix(y_true = labels_list, y_pred = pred_list))
-
-
-#download data into files
-zipped = list(zip(train_loss, test_loss, train_accuracy, test_accuracy))
-df = pd.DataFrame(zipped, columns=['Train Loss', 'Test Loss','Train Acc','Test Acc'])
-df.to_csv( filepath + '/results/both_adapt_new.csv', index=False, encoding='utf-8-sig')
-
-df = pd.read_csv(filepath + '/results/both_adapt_new.csv', encoding='utf-8-sig')
-df_smooth = df.ewm(alpha=(1 - 0.6)).mean()
-df_smooth.to_csv( filepath + '/results/both_adapt_smooth_new.csv', index=False, encoding='utf-8-sig')
